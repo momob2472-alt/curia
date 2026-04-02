@@ -11,16 +11,6 @@ CORS(app)
 CURIA_SEARCH  = "https://juris.curia.europa.eu/juris/recherche.jsf"
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-DIRECTIVE_CITATIONS = {
-    "2009/81":  "L,C,CJ,R,2009E,,2009,81,,,,,,,,true,false,false",
-    "2014/24":  "L,C,CJ,R,2014E,,2014,24,,,,,,,,true,false,false",
-    "2014/25":  "L,C,CJ,R,2014E,,2014,25,,,,,,,,true,false,false",
-    "2014/23":  "L,C,CJ,R,2014E,,2014,23,,,,,,,,true,false,false",
-    "2004/18":  "L,C,CJ,R,2004E,,2004,18,,,,,,,,true,false,false",
-    "2004/17":  "L,C,CJ,R,2004E,,2004,17,,,,,,,,true,false,false",
-    "2016/680": "L,C,CJ,R,2016E,,2016,680,,,,,,,,true,false,false",
-}
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -30,167 +20,78 @@ HEADERS = {
 }
 
 
-# ── Form vollständig auslesen ─────────────────────────────────────────────────
+# ── Curia POST-Suche ──────────────────────────────────────────────────────────
 
-def scrape_form(session):
+def search_curia(text=None, court="C", language="de",
+                 date_from=None, date_to=None):
     """
-    Loads the Curia search form and extracts ALL form fields
-    exactly as a browser would submit them — including submit buttons,
-    checkboxes (only if checked), selects, radio buttons.
-    Returns (action_url, field_dict, raw_html).
+    Submits the Curia search form via POST.
+    Field names and structure confirmed from /inspect endpoint.
     """
-    resp = session.get(CURIA_SEARCH, timeout=20)
-    resp.encoding = "utf-8"
-    html = resp.text
-    soup = BeautifulSoup(html, "lxml")
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    # Step 1: Load form to get session cookie + ViewState
+    try:
+        resp = session.get(CURIA_SEARCH, timeout=20)
+        resp.encoding = "utf-8"
+        soup = BeautifulSoup(resp.text, "lxml")
+    except Exception as e:
+        return [], CURIA_SEARCH, f"Form load error: {e}", {}
 
     form = soup.find("form", id="mainForm") or soup.find("form")
     if not form:
-        return CURIA_SEARCH, {}, html
+        return [], CURIA_SEARCH, "Form not found", {}
 
     action = form.get("action", CURIA_SEARCH)
     if action.startswith("/"):
         action = "https://juris.curia.europa.eu" + action
 
-    fields = {}
+    viewstate = ""
+    vs_input = form.find("input", {"name": "javax.faces.ViewState"})
+    if vs_input:
+        viewstate = vs_input.get("value", "")
 
-    for el in form.find_all(["input", "select", "textarea", "button"]):
-        name  = el.get("name", "")
-        itype = el.get("type", "text").lower()
-        if not name:
-            continue
+    # Step 2: Build POST data with exact field names from /inspect
+    post_data = {
+        # Required hidden field
+        "mainForm":                  "mainForm",
+        "javax.faces.ViewState":     viewstate,
 
-        if itype == "submit":
-            # Don't include submit buttons yet — we'll add the right one later
-            continue
-        elif itype == "checkbox":
-            # Only include if checked
-            if el.has_attr("checked"):
-                fields[name] = el.get("value", "on")
-        elif itype == "radio":
-            if el.has_attr("checked"):
-                fields[name] = el.get("value", "")
-        elif el.name == "select":
-            # Use selected option, or first option as default
-            selected = el.find("option", selected=True)
-            if not selected:
-                selected = el.find("option")
-            fields[name] = selected.get("value", "") if selected else ""
-        elif itype == "hidden":
-            fields[name] = el.get("value", "")
-        else:
-            # text, textarea, etc. — use default value
-            fields[name] = el.get("value", "")
+        # Sort preferences (defaults)
+        "mainForm:triPrefAff":       "def",
+        "mainForm:triPrefTri":       "def",
 
-    # Find submit buttons (to pick the right one later)
-    submit_buttons = []
-    for btn in form.find_all("input", type="submit"):
-        submit_buttons.append((btn.get("name",""), btn.get("value","")))
-    for btn in form.find_all("button", type="submit"):
-        submit_buttons.append((btn.get("name",""), btn.get("value","") or btn.get_text(strip=True)))
-    # Also look for image inputs (sometimes used as submit)
-    for btn in form.find_all("input", type="image"):
-        submit_buttons.append((btn.get("name",""), btn.get("value","")))
+        # Case status: closed cases only
+        "mainForm:critereAffaire":   "clot",
 
-    return action, fields, html, submit_buttons
+        # ECLI prefix (default value in form)
+        "mainForm:critereEcli":      "ECLI:EU:",
 
+        # Free text search ← our main search field
+        "mainForm:critereRechText":  text or "",
 
-# ── Formular-Inspektion (für Debug) ──────────────────────────────────────────
+        # Submit button ← confirmed name from /inspect
+        "mainForm:j_id108":          "Suchen",
+    }
 
-@app.route("/inspect")
-def inspect_form():
-    """Shows the raw form structure so we can see all fields and buttons."""
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    try:
-        action, fields, html, buttons = scrape_form(session)
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
-    soup = BeautifulSoup(html, "lxml")
-    # Find all inputs with their types and default values
-    form = soup.find("form", id="mainForm") or soup.find("form")
-    all_inputs = []
-    if form:
-        for el in form.find_all(["input", "select", "button"]):
-            all_inputs.append({
-                "tag":   el.name,
-                "type":  el.get("type",""),
-                "name":  el.get("name",""),
-                "value": el.get("value","")[:50] if el.get("value") else "",
-                "id":    el.get("id",""),
-            })
-
-    return jsonify({
-        "action":         action,
-        "submit_buttons": buttons,
-        "field_count":    len(fields),
-        "all_inputs":     all_inputs,
-        "field_names":    list(fields.keys()),
-    })
-
-
-# ── Curia POST-Suche ──────────────────────────────────────────────────────────
-
-def search_curia_post(text=None, directive=None, court="C",
-                      language="de", date_from=None, date_to=None):
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    try:
-        action, fields, html, buttons = scrape_form(session)
-    except Exception as e:
-        return [], CURIA_SEARCH, f"Form scrape error: {e}", {}
-
-    if not fields.get("javax.faces.ViewState"):
-        return [], CURIA_SEARCH, "No ViewState", {"fields": list(fields.keys())}
-
-    # ── Populate search fields using correct Curia field names ───────────────
-    post_data = dict(fields)  # start with all default form values
-
-    # Free text
-    if text:
-        post_data["mainForm:critereRechText"] = text
-
-    # Court checkboxes — set only the ones we want
-    for f in ["mainForm:jur_all","mainForm:jur_cour","mainForm:jur_tpi","mainForm:jur_tfp"]:
-        post_data.pop(f, None)  # remove defaults first
-
+    # Court selection — checkboxes: include field = checked, exclude = unchecked
+    # Confirmed from /inspect: value="" for all court checkboxes
+    if court in ("C", "C,T,F"):
+        post_data["mainForm:jur_cour"] = ""   # EuGH checked
+    if court in ("T", "C,T,F"):
+        post_data["mainForm:jur_tpi"]  = ""   # EuG checked
     if court == "C,T,F":
-        post_data["mainForm:jur_all"]  = "on"
-        post_data["mainForm:jur_cour"] = "C"
-        post_data["mainForm:jur_tpi"]  = "T"
-        post_data["mainForm:jur_tfp"]  = "F"
-    elif court == "C":
-        post_data["mainForm:jur_cour"] = "C"
-    elif court == "T":
-        post_data["mainForm:jur_tpi"]  = "T"
-
-    # Directive citation
-    if directive and directive in DIRECTIVE_CITATIONS:
-        post_data["mainForm:cit_motifs"] = DIRECTIVE_CITATIONS[directive]
+        post_data["mainForm:jur_all"]  = ""   # All checked
+        post_data["mainForm:jur_tfp"]  = ""   # EuGöD checked
 
     # Date range
     if date_from or date_to:
-        post_data["mainForm:dateFromToRB"] = "on"
+        post_data["mainForm:dateFromToRB"] = "fromTo"
         if date_from:
             post_data["mainForm:dateFromInput"] = date_from.replace("-", ".")
         if date_to:
             post_data["mainForm:dateToInput"] = date_to.replace("-", ".")
-
-    # ── Add the submit button ────────────────────────────────────────────────
-    # Try each button until we find one that looks like "search"
-    search_btn = None
-    for name, value in buttons:
-        v = value.lower()
-        if any(w in v for w in ["suchen","search","recherche","find","submit"]):
-            search_btn = (name, value)
-            break
-    # Fallback: use the last submit button (usually the search button)
-    if not search_btn and buttons:
-        search_btn = buttons[-1]
-    if search_btn and search_btn[0]:
-        post_data[search_btn[0]] = search_btn[1]
 
     session.headers.update({
         "Content-Type": "application/x-www-form-urlencoded",
@@ -199,26 +100,25 @@ def search_curia_post(text=None, directive=None, court="C",
     })
 
     try:
-        resp = session.post(action, data=post_data, timeout=30, allow_redirects=True)
-        resp.raise_for_status()
-        resp.encoding = "utf-8"
-        result_html = resp.text
+        resp2 = session.post(action, data=post_data, timeout=30, allow_redirects=True)
+        resp2.raise_for_status()
+        resp2.encoding = "utf-8"
+        result_html = resp2.text
     except Exception as e:
         return [], action, f"POST error: {e}", {}
 
     results = parse_curia_html(result_html)
 
-    soup2 = BeautifulSoup(result_html[:2000], "lxml")
-    page_title = soup2.title.string.strip() if soup2.title else ""
+    s2 = BeautifulSoup(result_html[:1500], "lxml")
+    page_title = s2.title.string.strip() if s2.title else ""
 
     debug = {
-        "page_title":      page_title,
-        "html_len":        len(result_html),
-        "viewstate_len":   len(fields.get("javax.faces.ViewState", "")),
-        "submit_buttons":  buttons,
-        "used_button":     search_btn,
-        "action":          action,
-        "text_field_set":  post_data.get("mainForm:critereRechText", "NOT SET"),
+        "page_title":    page_title,
+        "html_len":      len(result_html),
+        "viewstate":     viewstate,
+        "action":        action,
+        "text":          text,
+        "parsed_count":  len(results),
     }
     return results, action, None, debug
 
@@ -234,8 +134,9 @@ def parse_curia_html(html):
     if not rows:
         for row in soup.find_all("tr"):
             cells = row.find_all("td")
-            if len(cells) >= 3 and re.match(r"\d{2}\.\d{2}\.\d{4}",
-                                             cells[0].get_text(strip=True)):
+            if (len(cells) >= 3 and
+                    re.match(r"\d{2}\.\d{2}\.\d{4}",
+                             cells[0].get_text(strip=True))):
                 rows.append(row)
 
     for row in rows:
@@ -270,16 +171,39 @@ def parse_curia_html(html):
     return results
 
 
-# ── Debug ─────────────────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.route("/debug")
 def debug():
-    text      = request.args.get("text",      "").strip() or None
-    directive = request.args.get("directive", "").strip() or None
-    court     = request.args.get("court",     "C")
-    results, url, error, dbg = search_curia_post(text=text, directive=directive, court=court)
-    return jsonify({"error": error, "parsed_count": len(results),
-                    "debug": dbg, "first_results": results[:5]})
+    text  = request.args.get("text",  "").strip() or None
+    court = request.args.get("court", "C")
+    results, url, error, dbg = search_curia(text=text, court=court)
+    return jsonify({
+        "error":         error,
+        "parsed_count":  len(results),
+        "debug":         dbg,
+        "first_results": results[:5],
+    })
+
+
+@app.route("/inspect")
+def inspect():
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    resp = session.get(CURIA_SEARCH, timeout=20)
+    resp.encoding = "utf-8"
+    soup = BeautifulSoup(resp.text, "lxml")
+    form = soup.find("form", id="mainForm") or soup.find("form")
+    inputs = []
+    if form:
+        for el in form.find_all(["input","select","button"]):
+            inputs.append({
+                "tag": el.name, "type": el.get("type",""),
+                "name": el.get("name",""), "value": el.get("value","")[:40],
+                "id": el.get("id",""),
+            })
+    return jsonify({"inputs": inputs,
+                    "action": form.get("action","") if form else ""})
 
 
 # ── Claude API ────────────────────────────────────────────────────────────────
@@ -302,28 +226,29 @@ def claude(system, user, max_tokens=2000):
 
 
 def parse_json_response(text):
-    text = text.replace("```json", "").replace("```", "").strip()
+    text = text.replace("```json","").replace("```","").strip()
     m = re.search(r"[\[\{][\s\S]*[\]\}]", text)
     return json.loads(m.group(0) if m else text)
 
 
 def fetch_eurlex_text(az):
     try:
-        url = f"https://eur-lex.europa.eu/search.html?query={quote(az)}&DB_TYPE_OF_ACT=judgment&lang=de"
+        url = (f"https://eur-lex.europa.eu/search.html"
+               f"?query={quote(az)}&DB_TYPE_OF_ACT=judgment&lang=de")
         r = requests.get(url, headers=HEADERS, timeout=15)
         r.encoding = "utf-8"
         soup = BeautifulSoup(r.text, "lxml")
         link = soup.select_one("a.title")
         if not link:
             return None
-        href = link.get("href", "")
+        href = link.get("href","")
         if not href.startswith("http"):
             href = "https://eur-lex.europa.eu" + href
         doc = requests.get(href, headers=HEADERS, timeout=15)
         doc.encoding = "utf-8"
-        doc_soup = BeautifulSoup(doc.text, "lxml")
-        content = doc_soup.select_one("#document1, .eli-main-title, .textdocument")
-        return (content or doc_soup).get_text(separator="\n", strip=True)[:8000]
+        ds = BeautifulSoup(doc.text, "lxml")
+        c = ds.select_one("#document1, .eli-main-title, .textdocument")
+        return (c or ds).get_text(separator="\n", strip=True)[:8000]
     except Exception:
         return None
 
@@ -344,79 +269,83 @@ def research():
 
     steps = []
 
-    steps.append({"step": 1, "label": "Suchstrategie entwickeln", "status": "running"})
+    # Schritt 1: Suchstrategie
+    steps.append({"step":1,"label":"Suchstrategie entwickeln","status":"running"})
     try:
-        strategy_raw = claude(
-            system="""Du bist Experte für EU-Rechtsprechungsrecherche.
+        strat = parse_json_response(claude(
+            system="""EU-Rechtsprechungsrecherche-Experte.
 Antworte NUR mit JSON, keine Backticks:
 {
   "zusammenfassung": "Worum geht es (1 Satz)",
   "suchen": [
-    {"text": "Suchbegriff (max 4 Wörter)", "directive": "z.B. 2009/81 oder null",
-     "language": "de/en/fr", "begruendung": "warum"}
+    {"text":"Suchbegriff (max 4 Wörter, exakter juristischer Begriff)",
+     "language":"de/en/fr","begruendung":"warum"}
   ]
 }
-6-8 Varianten: kurze präzise juristische Begriffe, Artikel-Nummern als eigene Suche.""",
+6-8 Varianten. Nur Freitext-Suchbegriffe (keine Richtlinien-Filter).
+Kurze präzise Begriffe wie sie im Urteilstext stehen.
+Artikel-Nummern als eigene Suche: z.B. "Art. 346 AEUV".""",
             user=f"Rechtsfrage: {question}", max_tokens=1200,
-        )
-        strategy = parse_json_response(strategy_raw)
+        ))
         steps[-1]["status"] = "done"
-        steps[-1]["data"] = strategy
+        steps[-1]["data"] = strat
     except Exception as e:
         return jsonify({"error": f"Strategiefehler: {e}", "steps": steps}), 500
 
-    steps.append({"step": 2, "label": "Curia Datenbank durchsuchen", "status": "running"})
-    all_results, curia_urls, debug_log = [], [], []
+    # Schritt 2: Curia POST-Suchen
+    steps.append({"step":2,"label":"Curia Datenbank durchsuchen","status":"running"})
+    all_results, curia_urls, dbg_log = [], [], []
 
-    for s in strategy.get("suchen", [])[:7]:
-        directive = s.get("directive")
-        if str(directive).lower() in ("null", "none", ""):
-            directive = None
-        results, used_url, err, dbg = search_curia_post(
-            text=s.get("text"), directive=directive, court=court,
-            language=s.get("language", "de"),
-            date_from=date_from or None, date_to=date_to or None,
+    for s in strat.get("suchen",[])[:7]:
+        results, url, err, dbg = search_curia(
+            text=s.get("text"), court=court,
+            language=s.get("language","de"),
+            date_from=date_from or None,
+            date_to=date_to or None,
         )
         all_results.extend(results)
-        curia_urls.append({"label": s.get("text",""), "url": used_url})
-        debug_log.append({"query": s.get("text"), "found": len(results),
-                          "error": err, "page_title": dbg.get("page_title","")})
+        curia_urls.append({"label": s.get("text",""), "url": url})
+        dbg_log.append({"query": s.get("text"), "found": len(results),
+                        "error": err, "page_title": dbg.get("page_title","")})
         time.sleep(0.5)
 
     seen, unique = set(), []
     for r in all_results:
-        key = r["aktenzeichen"].replace(" ", "").lower()
+        key = r["aktenzeichen"].replace(" ","").lower()
         if key and key not in seen:
             seen.add(key); unique.append(r)
 
     steps[-1]["status"] = "done"
-    steps[-1]["data"] = {"gefunden": len(all_results), "nach_dedup": len(unique),
-                          "debug": debug_log}
+    steps[-1]["data"] = {"gefunden": len(all_results),
+                          "nach_dedup": len(unique), "debug": dbg_log}
 
     if not unique:
         return jsonify({"question": question,
-                        "zusammenfassung": strategy.get("zusammenfassung",""),
+                        "zusammenfassung": strat.get("zusammenfassung",""),
                         "steps": steps, "results": [],
-                        "curia_urls": curia_urls, "debug": debug_log})
+                        "curia_urls": curia_urls, "debug": dbg_log})
 
-    steps.append({"step": 3, "label": "Volltexte & Randnummern", "status": "running"})
+    # Schritt 3: Volltexte + Rn.
+    steps.append({"step":3,"label":"Volltexte & Randnummern","status":"running"})
     enriched = []
     for r in unique[:15]:
         az = r["aktenzeichen"]
-        fulltext = fetch_eurlex_text(az) if az else None
-        base = {**r, "eurlex_url": f"https://eur-lex.europa.eu/search.html?query={quote(az)}&DB_TYPE_OF_ACT=judgment"}
-        if fulltext:
+        ft = fetch_eurlex_text(az) if az else None
+        base = {**r, "eurlex_url":
+                f"https://eur-lex.europa.eu/search.html?query={quote(az)}&DB_TYPE_OF_ACT=judgment"}
+        if ft:
             try:
-                rn_data = parse_json_response(claude(
-                    system="""Analysiere ein EU-Urteil. Antworte NUR mit JSON:
-{"relevant":true/false,"relevanz":"hoch/mittel/niedrig","parteien":"...",
-"gericht":"EuGH oder EuG","kammer":"...","sachverhalt":"2-3 Sätze",
-"randnummern":[{"rn":"Rn. XX","inhalt":"Was steht dort (1 Satz)"}],
-"kernaussage":"Wichtigste Aussage (2-3 Sätze)"}""",
-                    user=f"Frage: {question}\n\nAktenzeichen: {az}\n\nText:\n{fulltext}",
+                rn = parse_json_response(claude(
+                    system="""EU-Urteil analysieren. NUR JSON, keine Backticks:
+{"relevant":true/false,"relevanz":"hoch/mittel/niedrig",
+"parteien":"Kläger / Beklagter","gericht":"EuGH oder EuG","kammer":"...",
+"sachverhalt":"2-3 Sätze",
+"randnummern":[{"rn":"Rn. XX","inhalt":"Konkrete Aussage (1 Satz)"}],
+"kernaussage":"Wichtigste Aussage zur Frage (2-3 Sätze)"}""",
+                    user=f"Frage: {question}\n\nAktenzeichen: {az}\n\nText:\n{ft}",
                     max_tokens=1200,
                 ))
-                enriched.append({**base, **rn_data, "volltext_verfuegbar": True})
+                enriched.append({**base, **rn, "volltext_verfuegbar": True})
             except Exception:
                 enriched.append({**base, "relevant": True, "relevanz": "mittel",
                                   "randnummern":[], "kernaussage":"", "sachverhalt":"",
@@ -428,39 +357,43 @@ Antworte NUR mit JSON, keine Backticks:
         time.sleep(0.2)
     steps[-1]["status"] = "done"
 
-    steps.append({"step": 4, "label": "Relevanzbewertung", "status": "running"})
+    # Schritt 4: Sortieren
+    steps.append({"step":4,"label":"Relevanzbewertung","status":"running"})
     relevant = [r for r in enriched if r.get("relevant", True)]
-    relevant.sort(key=lambda x: {"hoch":0,"mittel":1,"niedrig":2}.get(x.get("relevanz","mittel"),1))
+    relevant.sort(key=lambda x: {"hoch":0,"mittel":1,"niedrig":2}
+                  .get(x.get("relevanz","mittel"), 1))
     steps[-1]["status"] = "done"
-    steps[-1]["data"] = {"gesamt": len(relevant),
-                          "hoch":   sum(1 for r in relevant if r.get("relevanz")=="hoch"),
-                          "mittel": sum(1 for r in relevant if r.get("relevanz")=="mittel")}
+    steps[-1]["data"] = {
+        "gesamt": len(relevant),
+        "hoch":   sum(1 for r in relevant if r.get("relevanz")=="hoch"),
+        "mittel": sum(1 for r in relevant if r.get("relevanz")=="mittel"),
+    }
 
     return jsonify({"question": question,
-                    "zusammenfassung": strategy.get("zusammenfassung",""),
-                    "steps": steps, "results": relevant, "curia_urls": curia_urls[:4]})
+                    "zusammenfassung": strat.get("zusammenfassung",""),
+                    "steps": steps, "results": relevant,
+                    "curia_urls": curia_urls[:4]})
 
 
 @app.route("/search")
 def search():
-    text      = request.args.get("text","").strip() or None
-    directive = request.args.get("directive","").strip() or None
-    court     = request.args.get("court","C")
-    language  = request.args.get("language","de")
-    if not text and not directive:
-        return jsonify({"error": "Mindestens text oder directive angeben"}), 400
-    results, url, err, dbg = search_curia_post(
-        text=text, directive=directive, court=court, language=language)
-    return jsonify({"count": len(results), "error": err, "debug": dbg, "results": results})
+    text  = request.args.get("text","").strip() or None
+    court = request.args.get("court","C")
+    lang  = request.args.get("language","de")
+    if not text:
+        return jsonify({"error": "text parameter fehlt"}), 400
+    results, url, err, dbg = search_curia(text=text, court=court, language=lang)
+    return jsonify({"count": len(results), "error": err,
+                    "debug": dbg, "results": results})
 
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "anthropic_api": bool(ANTHROPIC_KEY)})
+    return jsonify({"status":"ok","anthropic_api": bool(ANTHROPIC_KEY)})
 
 @app.route("/")
 def index():
-    return jsonify({"name": "Curia Proxy v2", "status": "ok",
+    return jsonify({"name":"Curia Proxy v2","status":"ok",
                     "anthropic_api": bool(ANTHROPIC_KEY)})
 
 
