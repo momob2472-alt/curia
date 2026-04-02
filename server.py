@@ -342,3 +342,56 @@ def index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
+
+@app.route("/debug-html")
+def debug_html():
+    """Returns raw EUR-Lex HTML snippet so we can inspect the structure."""
+    text = request.args.get("text", "Militärausrüstung").strip()
+    lang = request.args.get("lang", "de")
+    url = (f"https://eur-lex.europa.eu/search.html"
+           f"?query={quote(text)}&DB_TYPE_OF_ACT=judgment&lang={lang}&qid=1")
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.encoding = "utf-8"
+        html = resp.text
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # Collect all classes used in the page to identify result containers
+    all_classes = set()
+    for el in soup.find_all(True):
+        for c in el.get("class", []):
+            all_classes.add(c)
+
+    # Find all links that look like judgment links
+    judgment_links = []
+    for a in soup.find_all("a", href=True)[:60]:
+        href = a.get("href","")
+        text_content = a.get_text(strip=True)[:80]
+        if any(x in href for x in ["CELEX","celex","TXT","judgment","arrêt","Urteil"]):
+            judgment_links.append({"href": href[:100], "text": text_content})
+
+    # First 3000 chars of body for structure inspection
+    body = soup.find("body")
+    body_snippet = body.get_text(separator="|", strip=True)[:1000] if body else ""
+
+    # All divs with class containing "result" or "search"
+    result_divs = []
+    for el in soup.find_all(class_=re.compile(r"result|search|content|item", re.I))[:20]:
+        result_divs.append({
+            "tag": el.name,
+            "classes": el.get("class",[]),
+            "text": el.get_text(strip=True)[:60]
+        })
+
+    return jsonify({
+        "status_code":     resp.status_code,
+        "html_len":        len(html),
+        "all_classes":     sorted(list(all_classes))[:50],
+        "judgment_links":  judgment_links[:10],
+        "result_divs":     result_divs[:15],
+        "body_snippet":    body_snippet,
+    })
