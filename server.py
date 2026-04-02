@@ -8,7 +8,6 @@ from urllib.parse import quote
 app = Flask(__name__)
 CORS(app)
 
-CURIA_SEARCH  = "https://juris.curia.europa.eu/juris/recherche.jsf"
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 HEADERS = {
@@ -16,194 +15,124 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
 }
 
 
-# ── Curia POST-Suche ──────────────────────────────────────────────────────────
+# ── EUR-Lex Suche ─────────────────────────────────────────────────────────────
 
-def search_curia(text=None, court="C", language="de",
-                 date_from=None, date_to=None):
+def search_eurlex(text, language="de", page=1):
     """
-    Submits the Curia search form via POST.
-    Field names and structure confirmed from /inspect endpoint.
+    Searches EUR-Lex for judgments. Returns structured results.
+    EUR-Lex is a regular web server — no JSF, no AJAX required.
+    Results are linked back to Curia via case number.
     """
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    # Step 1: Load form to get session cookie + ViewState
+    url = (
+        f"https://eur-lex.europa.eu/search.html"
+        f"?query={quote(text)}"
+        f"&DB_TYPE_OF_ACT=judgment"
+        f"&lang={language}"
+        f"&qid=1"
+        f"&page={page}"
+    )
     try:
-        resp = session.get(CURIA_SEARCH, timeout=20)
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
         resp.encoding = "utf-8"
-        soup = BeautifulSoup(resp.text, "lxml")
     except Exception as e:
-        return [], CURIA_SEARCH, f"Form load error: {e}", {}
+        return [], url, str(e)
 
-    form = soup.find("form", id="mainForm") or soup.find("form")
-    if not form:
-        return [], CURIA_SEARCH, "Form not found", {}
-
-    action = form.get("action", CURIA_SEARCH)
-    if action.startswith("/"):
-        action = "https://juris.curia.europa.eu" + action
-
-    viewstate = ""
-    vs_input = form.find("input", {"name": "javax.faces.ViewState"})
-    if vs_input:
-        viewstate = vs_input.get("value", "")
-
-    # Step 2: Build POST data with exact field names from /inspect
-    post_data = {
-        # Required hidden field
-        "mainForm":                  "mainForm",
-        "javax.faces.ViewState":     viewstate,
-
-        # Sort preferences (defaults)
-        "mainForm:triPrefAff":       "def",
-        "mainForm:triPrefTri":       "def",
-
-        # Case status: closed cases only
-        "mainForm:critereAffaire":   "clot",
-
-        # ECLI prefix (default value in form)
-        "mainForm:critereEcli":      "ECLI:EU:",
-
-        # Free text search ← our main search field
-        "mainForm:critereRechText":  text or "",
-
-        # Submit button ← confirmed name from /inspect
-        "mainForm:j_id108":          "Suchen",
-    }
-
-    # Court selection — checkboxes: include field = checked, exclude = unchecked
-    # Confirmed from /inspect: value="" for all court checkboxes
-    if court in ("C", "C,T,F"):
-        post_data["mainForm:jur_cour"] = ""   # EuGH checked
-    if court in ("T", "C,T,F"):
-        post_data["mainForm:jur_tpi"]  = ""   # EuG checked
-    if court == "C,T,F":
-        post_data["mainForm:jur_all"]  = ""   # All checked
-        post_data["mainForm:jur_tfp"]  = ""   # EuGöD checked
-
-    # Date range
-    if date_from or date_to:
-        post_data["mainForm:dateFromToRB"] = "fromTo"
-        if date_from:
-            post_data["mainForm:dateFromInput"] = date_from.replace("-", ".")
-        if date_to:
-            post_data["mainForm:dateToInput"] = date_to.replace("-", ".")
-
-    session.headers.update({
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": CURIA_SEARCH,
-        "Origin": "https://juris.curia.europa.eu",
-    })
-
-    try:
-        resp2 = session.post(action, data=post_data, timeout=30, allow_redirects=True)
-        resp2.raise_for_status()
-        resp2.encoding = "utf-8"
-        result_html = resp2.text
-    except Exception as e:
-        return [], action, f"POST error: {e}", {}
-
-    results = parse_curia_html(result_html)
-
-    s2 = BeautifulSoup(result_html[:1500], "lxml")
-    page_title = s2.title.string.strip() if s2.title else ""
-
-    debug = {
-        "page_title":    page_title,
-        "html_len":      len(result_html),
-        "viewstate":     viewstate,
-        "action":        action,
-        "text":          text,
-        "parsed_count":  len(results),
-    }
-    return results, action, None, debug
-
-
-def parse_curia_html(html):
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(resp.text, "lxml")
     results = []
 
-    rows = (
-        soup.select("table.detail tr.normal, table.detail tr.odd") or
-        soup.select("tr.normal, tr.odd") or []
+    # EUR-Lex result items — try multiple selectors
+    items = (
+        soup.select("div.EurlexContent") or
+        soup.select("li.EurlexContent") or
+        soup.select(".result-item") or
+        []
     )
-    if not rows:
-        for row in soup.find_all("tr"):
-            cells = row.find_all("td")
-            if (len(cells) >= 3 and
-                    re.match(r"\d{2}\.\d{2}\.\d{4}",
-                             cells[0].get_text(strip=True))):
-                rows.append(row)
 
-    for row in rows:
-        cells = row.find_all("td")
-        if len(cells) < 3:
+    # Fallback: all title links on the page
+    if not items:
+        for link in soup.select("a.title")[:25]:
+            title = link.get_text(strip=True)
+            href  = link.get("href","")
+            az    = _extract_case_number(title)
+            if az or "judgment" in title.lower() or re.search(r"C-\d|T-\d", title):
+                results.append(_make_result(az, title, "", href))
+        return results, url, None
+
+    for item in items:
+        # Title and link
+        title_el = item.select_one("a.title, .docTitle a, h2 a, h3 a")
+        if not title_el:
             continue
-        try:
-            datum = cells[0].get_text(strip=True)
-            if not re.match(r"\d{2}\.\d{2}\.\d{4}", datum):
-                continue
-            az, doc_url = "", ""
-            link = cells[1].find("a")
-            if link:
-                az = link.get_text(strip=True)
-                href = link.get("href", "")
-                doc_url = ("https://curia.europa.eu" + href
-                           if href.startswith("/") else href)
-            else:
-                az = cells[1].get_text(strip=True)
-            name = cells[2].get_text(strip=True) if len(cells) > 2 else ""
-            typ  = cells[3].get_text(strip=True) if len(cells) > 3 else ""
-            results.append({
-                "aktenzeichen": az.strip(),
-                "datum":        datum.strip(),
-                "parteien":     name.strip(),
-                "typ":          typ.strip(),
-                "curia_url":    f"https://curia.europa.eu/juris/liste.jsf?num={quote(az.strip())}" if az else "",
-                "doc_url":      doc_url,
-            })
-        except Exception:
-            continue
-    return results
+        title = title_el.get_text(strip=True)
+        href  = title_el.get("href","")
+        if not href.startswith("http"):
+            href = "https://eur-lex.europa.eu" + href
+
+        # Date
+        date_el = item.select_one(".docDate, .date, time, .Published")
+        datum = date_el.get_text(strip=True) if date_el else ""
+        datum = re.search(r"\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2}|\d{2}\.\d{2}\.\d{4}", datum or "")
+        datum = datum.group(0) if datum else ""
+
+        # Case number — extract from title or nearby text
+        az = _extract_case_number(title)
+        if not az:
+            az = _extract_case_number(item.get_text())
+
+        if az or title:
+            results.append(_make_result(az, title, datum, href))
+
+    return results, url, None
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-
-@app.route("/debug")
-def debug():
-    text  = request.args.get("text",  "").strip() or None
-    court = request.args.get("court", "C")
-    results, url, error, dbg = search_curia(text=text, court=court)
-    return jsonify({
-        "error":         error,
-        "parsed_count":  len(results),
-        "debug":         dbg,
-        "first_results": results[:5],
-    })
+def _extract_case_number(text):
+    """Extracts EuGH/EuG case number from text."""
+    m = re.search(r"\b([CT]‑\d+/\d+|[CT]-\d+/\d+|C‐\d+/\d+)", text or "")
+    if m:
+        return m.group(1).replace("‑","‐").replace("‑","-").replace("‐","-")
+    return ""
 
 
-@app.route("/inspect")
-def inspect():
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    resp = session.get(CURIA_SEARCH, timeout=20)
-    resp.encoding = "utf-8"
-    soup = BeautifulSoup(resp.text, "lxml")
-    form = soup.find("form", id="mainForm") or soup.find("form")
-    inputs = []
-    if form:
-        for el in form.find_all(["input","select","button"]):
-            inputs.append({
-                "tag": el.name, "type": el.get("type",""),
-                "name": el.get("name",""), "value": el.get("value","")[:40],
-                "id": el.get("id",""),
-            })
-    return jsonify({"inputs": inputs,
-                    "action": form.get("action","") if form else ""})
+def _make_result(az, title, datum, eurlex_url):
+    return {
+        "aktenzeichen": az,
+        "parteien":     title,
+        "datum":        datum,
+        "eurlex_url":   eurlex_url,
+        "curia_url":    f"https://curia.europa.eu/juris/liste.jsf?num={quote(az)}" if az else "",
+    }
+
+
+# ── EUR-Lex Volltext für Randnummern ─────────────────────────────────────────
+
+def fetch_fulltext(az_or_url):
+    """Fetches judgment full text from EUR-Lex."""
+    try:
+        if az_or_url.startswith("http"):
+            url = az_or_url
+        else:
+            search = (f"https://eur-lex.europa.eu/search.html"
+                      f"?query={quote(az_or_url)}&DB_TYPE_OF_ACT=judgment&lang=de")
+            r = requests.get(search, headers=HEADERS, timeout=15)
+            r.encoding = "utf-8"
+            soup = BeautifulSoup(r.text, "lxml")
+            link = soup.select_one("a.title")
+            if not link:
+                return None
+            href = link.get("href","")
+            url = href if href.startswith("http") else "https://eur-lex.europa.eu"+href
+
+        doc = requests.get(url, headers=HEADERS, timeout=20)
+        doc.encoding = "utf-8"
+        ds = BeautifulSoup(doc.text, "lxml")
+        content = ds.select_one("#document1, .eli-main-title, .textdocument, .doc-ti")
+        return (content or ds).get_text(separator="\n", strip=True)[:9000]
+    except Exception:
+        return None
 
 
 # ── Claude API ────────────────────────────────────────────────────────────────
@@ -225,32 +154,25 @@ def claude(system, user, max_tokens=2000):
     return r.json()["content"][0]["text"]
 
 
-def parse_json_response(text):
+def parse_json(text):
     text = text.replace("```json","").replace("```","").strip()
     m = re.search(r"[\[\{][\s\S]*[\]\}]", text)
     return json.loads(m.group(0) if m else text)
 
 
-def fetch_eurlex_text(az):
-    try:
-        url = (f"https://eur-lex.europa.eu/search.html"
-               f"?query={quote(az)}&DB_TYPE_OF_ACT=judgment&lang=de")
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.encoding = "utf-8"
-        soup = BeautifulSoup(r.text, "lxml")
-        link = soup.select_one("a.title")
-        if not link:
-            return None
-        href = link.get("href","")
-        if not href.startswith("http"):
-            href = "https://eur-lex.europa.eu" + href
-        doc = requests.get(href, headers=HEADERS, timeout=15)
-        doc.encoding = "utf-8"
-        ds = BeautifulSoup(doc.text, "lxml")
-        c = ds.select_one("#document1, .eli-main-title, .textdocument")
-        return (c or ds).get_text(separator="\n", strip=True)[:8000]
-    except Exception:
-        return None
+# ── Debug EUR-Lex ─────────────────────────────────────────────────────────────
+
+@app.route("/debug")
+def debug():
+    text = request.args.get("text","").strip()
+    lang = request.args.get("lang","de")
+    results, url, err = search_eurlex(text, language=lang)
+    return jsonify({
+        "search_url":    url,
+        "error":         err,
+        "parsed_count":  len(results),
+        "first_results": results[:5],
+    })
 
 
 # ── Research ──────────────────────────────────────────────────────────────────
@@ -258,7 +180,6 @@ def fetch_eurlex_text(az):
 @app.route("/research")
 def research():
     question  = request.args.get("q",         "").strip()
-    court     = request.args.get("court",     "C")
     date_from = request.args.get("date_from", "")
     date_to   = request.args.get("date_to",   "")
 
@@ -272,19 +193,23 @@ def research():
     # Schritt 1: Suchstrategie
     steps.append({"step":1,"label":"Suchstrategie entwickeln","status":"running"})
     try:
-        strat = parse_json_response(claude(
-            system="""EU-Rechtsprechungsrecherche-Experte.
+        strat = parse_json(claude(
+            system="""Du bist Experte für EU-Rechtsprechungsrecherche.
 Antworte NUR mit JSON, keine Backticks:
 {
   "zusammenfassung": "Worum geht es (1 Satz)",
   "suchen": [
-    {"text":"Suchbegriff (max 4 Wörter, exakter juristischer Begriff)",
+    {"text":"Suchbegriff (max 5 Wörter, exakter juristischer Begriff)",
      "language":"de/en/fr","begruendung":"warum"}
   ]
 }
-6-8 Varianten. Nur Freitext-Suchbegriffe (keine Richtlinien-Filter).
-Kurze präzise Begriffe wie sie im Urteilstext stehen.
-Artikel-Nummern als eigene Suche: z.B. "Art. 346 AEUV".""",
+6-8 Varianten:
+- Deutsche juristische Fachbegriffe
+- Englische Entsprechungen (wichtig: EUR-Lex hat englische Volltexte)
+- Französische Entsprechungen
+- Artikelnummern als eigene Suche (z.B. "Article 346 TFEU")
+- Richtliniennummern als Suchbegriff (z.B. "directive 2009/81")
+Kurze, präzise Begriffe wie sie in Urteilstexten stehen.""",
             user=f"Rechtsfrage: {question}", max_tokens=1200,
         ))
         steps[-1]["status"] = "done"
@@ -292,28 +217,31 @@ Artikel-Nummern als eigene Suche: z.B. "Art. 346 AEUV".""",
     except Exception as e:
         return jsonify({"error": f"Strategiefehler: {e}", "steps": steps}), 500
 
-    # Schritt 2: Curia POST-Suchen
-    steps.append({"step":2,"label":"Curia Datenbank durchsuchen","status":"running"})
-    all_results, curia_urls, dbg_log = [], [], []
+    # Schritt 2: EUR-Lex durchsuchen
+    steps.append({"step":2,"label":"EUR-Lex Rechtsprechungsdatenbank durchsuchen","status":"running"})
+    all_results, search_urls, dbg_log = [], [], []
 
     for s in strat.get("suchen",[])[:7]:
-        results, url, err, dbg = search_curia(
-            text=s.get("text"), court=court,
-            language=s.get("language","de"),
-            date_from=date_from or None,
-            date_to=date_to or None,
-        )
+        text_q = s.get("text","")
+        lang   = s.get("language","de")
+        results, url, err = search_eurlex(text_q, language=lang)
         all_results.extend(results)
-        curia_urls.append({"label": s.get("text",""), "url": url})
-        dbg_log.append({"query": s.get("text"), "found": len(results),
-                        "error": err, "page_title": dbg.get("page_title","")})
-        time.sleep(0.5)
+        search_urls.append({"label": text_q, "url": url})
+        dbg_log.append({"query": text_q, "lang": lang,
+                        "found": len(results), "error": err})
+        time.sleep(0.4)
 
+    # Deduplizieren nach Aktenzeichen
     seen, unique = set(), []
     for r in all_results:
         key = r["aktenzeichen"].replace(" ","").lower()
         if key and key not in seen:
             seen.add(key); unique.append(r)
+        elif not key:
+            # Keep results without case number too (for text-only entries)
+            title_key = r["parteien"][:40].lower()
+            if title_key not in seen:
+                seen.add(title_key); unique.append(r)
 
     steps[-1]["status"] = "done"
     steps[-1]["data"] = {"gefunden": len(all_results),
@@ -323,26 +251,38 @@ Artikel-Nummern als eigene Suche: z.B. "Art. 346 AEUV".""",
         return jsonify({"question": question,
                         "zusammenfassung": strat.get("zusammenfassung",""),
                         "steps": steps, "results": [],
-                        "curia_urls": curia_urls, "debug": dbg_log})
+                        "search_urls": search_urls, "debug": dbg_log})
 
-    # Schritt 3: Volltexte + Rn.
-    steps.append({"step":3,"label":"Volltexte & Randnummern","status":"running"})
+    # Schritt 3: Volltexte + Randnummern
+    steps.append({"step":3,"label":"Volltexte analysieren & Randnummern extrahieren","status":"running"})
     enriched = []
     for r in unique[:15]:
-        az = r["aktenzeichen"]
-        ft = fetch_eurlex_text(az) if az else None
-        base = {**r, "eurlex_url":
-                f"https://eur-lex.europa.eu/search.html?query={quote(az)}&DB_TYPE_OF_ACT=judgment"}
+        az  = r.get("aktenzeichen","")
+        url = r.get("eurlex_url","")
+        ft  = fetch_fulltext(url or az) if (url or az) else None
+
+        base = dict(r)
         if ft:
             try:
-                rn = parse_json_response(claude(
-                    system="""EU-Urteil analysieren. NUR JSON, keine Backticks:
-{"relevant":true/false,"relevanz":"hoch/mittel/niedrig",
-"parteien":"Kläger / Beklagter","gericht":"EuGH oder EuG","kammer":"...",
-"sachverhalt":"2-3 Sätze",
-"randnummern":[{"rn":"Rn. XX","inhalt":"Konkrete Aussage (1 Satz)"}],
-"kernaussage":"Wichtigste Aussage zur Frage (2-3 Sätze)"}""",
-                    user=f"Frage: {question}\n\nAktenzeichen: {az}\n\nText:\n{ft}",
+                rn = parse_json(claude(
+                    system="""Analysiere ein EU-Gerichtsurteil auf Relevanz für eine Rechtsfrage.
+Antworte NUR mit JSON, keine Backticks:
+{
+  "relevant": true/false,
+  "relevanz": "hoch/mittel/niedrig",
+  "parteien": "Kläger / Beklagter (aus dem Text)",
+  "gericht": "EuGH oder EuG",
+  "kammer": "z.B. Dritte Kammer",
+  "datum": "TT.MM.JJJJ",
+  "sachverhalt": "2-3 Sätze: Worum geht es",
+  "randnummern": [
+    {"rn": "Rn. XX", "inhalt": "Was sagt das Gericht dort zur Frage (1 Satz)"}
+  ],
+  "kernaussage": "Wichtigste Aussage zur Rechtsfrage (2-3 Sätze)"
+}
+Nur Rn. nennen die im Volltext nachweislich vorkommen.
+Wenn nicht relevant: relevant=false.""",
+                    user=f"Rechtsfrage: {question}\n\nAktenzeichen: {az}\n\nUrteilstext:\n{ft}",
                     max_tokens=1200,
                 ))
                 enriched.append({**base, **rn, "volltext_verfuegbar": True})
@@ -357,11 +297,11 @@ Artikel-Nummern als eigene Suche: z.B. "Art. 346 AEUV".""",
         time.sleep(0.2)
     steps[-1]["status"] = "done"
 
-    # Schritt 4: Sortieren
+    # Schritt 4: Sortieren + Bewerten
     steps.append({"step":4,"label":"Relevanzbewertung","status":"running"})
     relevant = [r for r in enriched if r.get("relevant", True)]
     relevant.sort(key=lambda x: {"hoch":0,"mittel":1,"niedrig":2}
-                  .get(x.get("relevanz","mittel"), 1))
+                  .get(x.get("relevanz","mittel"),1))
     steps[-1]["status"] = "done"
     steps[-1]["data"] = {
         "gesamt": len(relevant),
@@ -369,22 +309,24 @@ Artikel-Nummern als eigene Suche: z.B. "Art. 346 AEUV".""",
         "mittel": sum(1 for r in relevant if r.get("relevanz")=="mittel"),
     }
 
-    return jsonify({"question": question,
-                    "zusammenfassung": strat.get("zusammenfassung",""),
-                    "steps": steps, "results": relevant,
-                    "curia_urls": curia_urls[:4]})
+    return jsonify({
+        "question":        question,
+        "zusammenfassung": strat.get("zusammenfassung",""),
+        "steps":           steps,
+        "results":         relevant,
+        "search_urls":     search_urls[:4],
+    })
 
 
 @app.route("/search")
 def search():
-    text  = request.args.get("text","").strip() or None
-    court = request.args.get("court","C")
-    lang  = request.args.get("language","de")
+    text = request.args.get("text","").strip()
+    lang = request.args.get("language","de")
     if not text:
         return jsonify({"error": "text parameter fehlt"}), 400
-    results, url, err, dbg = search_curia(text=text, court=court, language=lang)
-    return jsonify({"count": len(results), "error": err,
-                    "debug": dbg, "results": results})
+    results, url, err = search_eurlex(text, language=lang)
+    return jsonify({"count": len(results), "search_url": url,
+                    "error": err, "results": results})
 
 
 @app.route("/health")
@@ -393,7 +335,7 @@ def health():
 
 @app.route("/")
 def index():
-    return jsonify({"name":"Curia Proxy v2","status":"ok",
+    return jsonify({"name":"Curia Proxy v2 (EUR-Lex)","status":"ok",
                     "anthropic_api": bool(ANTHROPIC_KEY)})
 
 
