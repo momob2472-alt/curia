@@ -1,0 +1,110 @@
+# Curia Proxy — Einrichtung & Nutzung
+
+## Was ist das?
+
+Ein lokaler Python-Server, der Curia-Anfragen serverseitig ausführt und die
+Ergebnisse als JSON zurückgibt. Löst das CORS-Problem: Browser können nicht
+direkt auf juris.curia.europa.eu zugreifen, der Proxy schon.
+
+## Voraussetzungen
+
+- Python 3.10 oder neuer
+- pip
+
+## Installation (einmalig, 1 Minute)
+
+```bash
+# 1. In den Ordner wechseln
+cd curia-proxy
+
+# 2. Virtuelle Umgebung erstellen
+python -m venv venv
+source venv/bin/activate        # Mac/Linux
+# venv\Scripts\activate         # Windows
+
+# 3. Abhängigkeiten installieren
+pip install -r requirements.txt
+```
+
+## Starten
+
+```bash
+source venv/bin/activate
+python server.py
+# → Curia Proxy läuft auf http://localhost:5000
+```
+
+Den Server laufen lassen, solange du das Tool nutzt. Im Browser ändert sich nichts.
+
+## API-Referenz
+
+### GET /search
+
+| Parameter  | Bedeutung                              | Beispiel           |
+|------------|----------------------------------------|--------------------|
+| text       | Freitextsuche                          | Militärausrüstung  |
+| directive  | Richtlinie (Zitationsfilter)           | 2009/81            |
+| article    | Artikel (wird dem Text hinzugefügt)    | Art. 346           |
+| court      | Gerichte: C, T, C,T,F                  | C                  |
+| language   | Sprache: de, en, fr                    | de                 |
+| date_from  | Datum von (YYYY-MM-DD)                 | 2010-01-01         |
+| date_to    | Datum bis (YYYY-MM-DD)                 | 2024-12-31         |
+
+**Beispiel:**
+```
+GET http://localhost:5000/search?text=Militärausrüstung&directive=2009/81&court=C
+```
+
+**Antwort:**
+```json
+{
+  "total": 12,
+  "count": 12,
+  "curia_url": "https://juris.curia.europa.eu/juris/recherche.jsf?...",
+  "results": [
+    {
+      "aktenzeichen": "C-615/10",
+      "datum": "07.06.2012",
+      "parteien": "Insinööritoimisto InsTiimi Oy",
+      "typ": "Urteil",
+      "curia_url": "https://curia.europa.eu/juris/liste.jsf?num=C-615/10",
+      "doc_url": "https://curia.europa.eu/juris/document/..."
+    }
+  ]
+}
+```
+
+### GET /directives
+
+Gibt alle vorkonfigurierten Richtlinien zurück:
+```json
+{"directives": ["2009/81", "2014/24", "2014/25", ...]}
+```
+
+### GET /health
+
+Statuscheck: `{"status": "ok"}`
+
+## Eigene Richtlinien hinzufügen
+
+In `server.py` unter `DIRECTIVE_CITATIONS` eintragen:
+
+```python
+"JAHR/NUMMER": "L%2CC%2CCJ%2CR%2C{OJ-JAHR}E%2C%2C{JAHR}%2C{NUMMER}%2C..."
+```
+
+Den kodierten Wert bekommst du, indem du in Curia manuell nach der Richtlinie
+filterst, die URL kopierst und den `cit=`-Parameter extrahierst.
+
+## Deployment (optional, für Team-Nutzung)
+
+Für mehrere Nutzer kannst du den Proxy auf einem Server deployen:
+
+```bash
+# Mit gunicorn (produktionstauglich)
+pip install gunicorn
+gunicorn -w 4 -b 0.0.0.0:5000 server:app
+```
+
+Auf Render.com, Railway oder einem eigenen Server deployen.
+Dann im Frontend `PROXY_URL` auf die öffentliche URL setzen.
